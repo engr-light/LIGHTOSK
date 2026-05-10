@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import inspect
 import logging
+import numbers
 from datetime import datetime, timezone
 import dotenv
 from typing import Literal
@@ -251,6 +252,60 @@ class SpringTemplateBot2026(ForecastBot):
             research = "\n\n".join(source_sections).strip()
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    def _should_extremize_minibench_report(self, report: object) -> bool:
+        reasoning = getattr(report, "reasoning", None)
+        if not isinstance(reasoning, str):
+            return False
+        evidence_keywords = ["evidence", "supports", "support", "strongly supports", "strong evidence"]
+        text = reasoning.lower()
+        return any(keyword in text for keyword in evidence_keywords)
+
+    def _extremize_report_value(self, report: object, extreme_value: float = 4.3) -> bool:
+        prediction = getattr(report, "prediction_value", None)
+        if prediction is None:
+            return False
+
+        if isinstance(prediction, numbers.Real):
+            setattr(report, "prediction_value", extreme_value)
+            return True
+
+        if hasattr(prediction, "declared_percentiles"):
+            try:
+                declared = getattr(prediction, "declared_percentiles")
+                if isinstance(declared, list):
+                    setattr(prediction, "declared_percentiles", [extreme_value] * len(declared))
+                    return True
+                if isinstance(declared, dict):
+                    setattr(prediction, "declared_percentiles", {k: extreme_value for k in declared})
+                    return True
+            except Exception:
+                pass
+
+        if isinstance(prediction, list):
+            try:
+                setattr(report, "prediction_value", [extreme_value] * len(prediction))
+                return True
+            except Exception:
+                pass
+
+        if isinstance(prediction, dict):
+            try:
+                setattr(report, "prediction_value", {k: extreme_value for k in prediction})
+                return True
+            except Exception:
+                pass
+
+        return False
+
+    def _extremize_minibench_reports(self, reports: list[object]) -> None:
+        for report in reports:
+            if self._should_extremize_minibench_report(report):
+                applied = self._extremize_report_value(report, extreme_value=4.3)
+                if applied:
+                    logger.info(
+                        f"Applied Minibench extremization to report: {getattr(report, 'question', getattr(report, 'page_url', 'unknown'))}"
+                    )
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -773,7 +828,7 @@ if __name__ == "__main__":
 
     client = MetaculusClient()
     if run_mode == "tournament":
-        # You may want to change this to the specific tournament ID you want to forecast on
+        # Forecast on the seasonal AI tournament, MiniBench, and the explicit tournament 33022.
         seasonal_tournament_reports = asyncio.run(
             template_bot.forecast_on_tournament(
                 client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
@@ -784,7 +839,11 @@ if __name__ == "__main__":
                 client.CURRENT_MINIBENCH_ID, return_exceptions=True
             )
         )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
+        extra_reports = asyncio.run(
+            template_bot.forecast_on_tournament(33022, return_exceptions=True)
+        )
+        template_bot._extremize_minibench_reports(minibench_reports)
+        forecast_reports = seasonal_tournament_reports + minibench_reports + extra_reports
     elif run_mode == "metaculus_cup":
         # The Metaculus cup is a good way to test the bot's performance on regularly open questions. You can also use AXC_2025_TOURNAMENT_ID = 32564 or AI_2027_TOURNAMENT_ID = "ai-2027"
         # The Metaculus cup may not be initialized near the beginning of a season (i.e. January, May, September)
