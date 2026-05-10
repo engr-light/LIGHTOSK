@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import inspect
 import logging
 from datetime import datetime, timezone
 import dotenv
@@ -123,7 +124,6 @@ class SpringTemplateBot2026(ForecastBot):
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
             researcher = self.get_llm("researcher")
 
             prompt = clean_indents(
@@ -143,19 +143,41 @@ class SpringTemplateBot2026(ForecastBot):
                 """
             )
 
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
+            if not researcher or researcher == "None" or researcher == "no_research":
+                return ""
+
+            async def _invoke_searcher_class(
+                class_name: str, model_name: str | None = None
+            ) -> str:
+                try:
+                    module = __import__("forecasting_tools", fromlist=[class_name])
+                    searcher_cls = getattr(module, class_name)
+                except (ImportError, AttributeError):
+                    return ""
+
+                kwargs = {}
+                signature = inspect.signature(searcher_cls)
+                if model_name is not None and "model" in signature.parameters:
+                    kwargs["model"] = model_name
+                if "temperature" in signature.parameters:
+                    kwargs["temperature"] = 0
+                if "num_searches_to_run" in signature.parameters:
+                    kwargs["num_searches_to_run"] = 2
+                if "num_sites_per_search" in signature.parameters:
+                    kwargs["num_sites_per_search"] = 8
+                if "use_advanced_filters" in signature.parameters:
+                    kwargs["use_advanced_filters"] = False
+
+                searcher = searcher_cls(**kwargs)
+                return await searcher.invoke(prompt)
+
+            async def _run_tavily_research() -> str:
+                return await _invoke_searcher_class("TavilySearcher", "openrouter/free")
+
+            async def _run_serpapi_research() -> str:
+                return await _invoke_searcher_class("SerpApiSearcher", "openrouter/free")
+
+            async def _run_smart_searcher(model_name: str) -> str:
                 searcher = SmartSearcher(
                     model=model_name,
                     temperature=0,
@@ -163,11 +185,70 @@ class SpringTemplateBot2026(ForecastBot):
                     num_sites_per_search=10,
                     use_advanced_filters=False,
                 )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
+                return await searcher.invoke(prompt)
+
+            async def _run_asknews(researcher_str: str) -> str:
+                return await AskNewsSearcher().call_preconfigured_version(
+                    researcher_str, prompt
+                )
+
+            async def _run_llm(llm: GeneralLlm) -> str:
+                return await llm.invoke(prompt)
+
+            tasks = []
+            source_names = []
+
+            if isinstance(researcher, GeneralLlm):
+                tasks.append(_run_llm(researcher))
+                source_names.append("LLM Researcher")
+            elif isinstance(researcher, str):
+                if researcher in (
+                    "asknews/news-summaries",
+                    "asknews/deep-research/low-depth",
+                    "asknews/deep-research/medium-depth",
+                    "asknews/deep-research/high-depth",
+                ):
+                    tasks.append(_run_asknews(researcher))
+                    source_names.append(researcher)
+                if researcher.startswith("smart-searcher"):
+                    model_name = researcher.removeprefix("smart-searcher/")
+                    tasks.append(_run_smart_searcher(model_name))
+                    source_names.append("SmartSearcher")
+                elif "/" in researcher and not researcher.startswith("asknews"):
+                    tasks.append(_run_smart_searcher(researcher))
+                    source_names.append("SmartSearcher")
+                if researcher == "tavily":
+                    tasks.append(_run_tavily_research())
+                    source_names.append("Tavily")
+                if researcher == "serpapi":
+                    tasks.append(_run_serpapi_research())
+                    source_names.append("SerpAPI")
+
+            if "SmartSearcher" not in source_names:
+                tasks.append(_run_smart_searcher("openrouter/free"))
+                source_names.append("SmartSearcher")
+            if "Tavily" not in source_names:
+                tasks.append(_run_tavily_research())
+                source_names.append("Tavily")
+            if "SerpAPI" not in source_names:
+                tasks.append(_run_serpapi_research())
+                source_names.append("SerpAPI")
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            source_sections = []
+
+            for source_name, result in zip(source_names, results):
+                if isinstance(result, Exception):
+                    logger.warning(
+                        f"Research source {source_name} failed for URL {question.page_url}: {result}"
+                    )
+                    continue
+                section = str(result).strip()
+                if not section:
+                    continue
+                source_sections.append(f"---\nSource: {source_name}\n{section}")
+
+            research = "\n\n".join(source_sections).strip()
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
@@ -673,17 +754,21 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
+            "default": GeneralLlm(
+                model="openrouter/free",
+                temperature=0.3,
+                timeout=40,
+                allowed_tries=2,
+            ),
+            "researcher": "smart-searcher/openrouter/free",
+            "parser": GeneralLlm(
+                model="openrouter/free",
+                temperature=0,
+                timeout=30,
+                allowed_tries=2,
+            ),
+        },
     )
 
     client = MetaculusClient()
